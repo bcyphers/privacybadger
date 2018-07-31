@@ -459,7 +459,8 @@ Badger.prototype = {
     sendDNTSignal: true,
     showCounter: true,
     showTrackingDomains: false,
-    socialWidgetReplacementEnabled: true
+    socialWidgetReplacementEnabled: true,
+    passiveMode: false
   },
 
   /**
@@ -676,7 +677,7 @@ Badger.prototype = {
   },
 
   /**
-   * Checks if local storage ( in dict) has any high-entropy keys
+   * Checks if local storage (in dict) has any high-entropy keys
    *
    * @param lsItems Local storage dict
    * @returns {boolean} true if it seems there are supercookies
@@ -685,7 +686,8 @@ Badger.prototype = {
     var LOCALSTORAGE_ENTROPY_THRESHOLD = 33, // in bits
       estimatedEntropy = 0,
       lsKey = "",
-      lsItem = "";
+      lsItem = "",
+      tracking = false;
     for (lsKey in lsItems) {
       // send both key and value to entropy estimation
       lsItem = lsItems[lsKey];
@@ -693,8 +695,13 @@ Badger.prototype = {
       estimatedEntropy += utils.estimateMaxEntropy(lsKey + lsItem);
       if (estimatedEntropy > LOCALSTORAGE_ENTROPY_THRESHOLD) {
         log("Found hi-entropy localStorage: ", estimatedEntropy, " bits, key: ", lsKey);
-        return true;
+        tracking = true;
+        break;
       }
+    }
+
+    if (tracking) {
+      return lsItems;
     }
     return false;
   },
