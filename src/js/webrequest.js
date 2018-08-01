@@ -200,7 +200,7 @@ function onBeforeSendHeaders(details) {
     }
   }
 
-  if (!badger.isPrivacyBadgerEnabled(tabDomain) || 
+  if (!badger.isPrivacyBadgerEnabled(tabDomain) ||
       badger.getSettings().getItem('passiveMode')) {
     return {};
   }
@@ -390,7 +390,7 @@ function recordSuperCookie(tab_id, frame_url, cookie) {
   }
 
   const frame_host = window.extractHostFromURL(frame_url),
-  var {url: page_url, host: page_host} = badger.getFrameData(sender.tab.id);
+    {url: page_url, host: page_host} = badger.getFrameData(tab_id);
 
   if (!isThirdPartyDomain(frame_host, page_host)) {
     // Only happens on the start page for google.com
@@ -474,7 +474,7 @@ function recordFingerprinting(tabId, msg) {
           badger.heuristicBlocking.updateTrackerPrevalence(
             script_host, window.getBaseDomain(pageHost), {
               type: constants.TRACKER_TYPES.FINGERPRINT,
-              trackerUrl: msg.scriptUrl, 
+              trackerUrl: msg.scriptUrl,
               pageUrl: pageUrl
           });
         }
