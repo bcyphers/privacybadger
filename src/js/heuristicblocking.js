@@ -128,41 +128,64 @@ HeuristicBlocker.prototype = {
       return {};
     }
 
-    // short-circuit if we already observed this origin tracking on this site
-    let firstParties = self.storage.getBadgerStorageObject('snitch_map').getItem(request_origin);
-    if (firstParties && firstParties.indexOf(tab_origin) > -1) {
+    // log the third-party request before tracking assessment
+    badger.logThirdPartyRequest(details.tabId, details.url);
+
+    // if we're in passive mode, check for tracking actions even if we've seen
+    // this tracker/page combination before
+    if (!badger.getSettings().getItem('passiveMode')) {
+      // short-circuit if we already observed this origin tracking on this site
+      let firstParties = self.storage.getBadgerStorageObject('snitch_map').getItem(request_origin);
+      if (firstParties && firstParties.indexOf(tab_origin) > -1) {
+        return {};
+      }
+
+      // abort if we already made a decision for this host
+      let action = self.storage.getAction(request_host);
+      if (action != constants.NO_TRACKING && action != constants.ALLOW) {
+        return {};
+      }
+    }
+
+    let cookies = hasCookieTracking(details, request_origin);
+
+    // if there are tracking cookies, log the tracking action and quit
+    if (cookies) {
+      let {url: page_url, host: page_host} = badger.getFrameData(details.tabId);
+
+      self._recordPrevalence(request_host, request_origin, tab_origin, {
+        type: constants.TRACKER_TYPES.COOKIE,
+        tracker_url: details.url,
+        page_url: page_url,
+        page_host: page_host,
+        details: cookies
+      });
       return {};
     }
 
-    // abort if we already made a decision for this FQDN
-    let action = self.storage.getAction(request_host);
-    if (action != constants.NO_TRACKING && action != constants.ALLOW) {
-      return {};
-    }
+    // check for cookie sharing iff this is an image in the top-level frame, and
+    // the request URL has parameters
+    if (check_for_cookie_share && details.type == 'image' &&
+        details.frameId === 0 && details.url.indexOf('?') > -1) {
 
-    // check if there are tracking cookies
-    if (hasCookieTracking(details, request_origin)) {
-      self._recordPrevalence(request_host, request_origin, tab_origin);
-      return {};
-    }
-
-    // check for cookie sharing iff this is an image in the top-level frame, and the request URL has parameters
-    if (check_for_cookie_share && details.type == 'image' && details.frameId === 0 && details.url.indexOf('?') > -1) {
-      // get all non-HttpOnly cookies for the top-level frame
-      // and pass those to the cookie-share accounting function
       let tab_url = self.tabUrls[details.tabId];
 
       let config = {
         url: tab_url
       };
+
       if (badger.firstPartyDomainPotentiallyRequired) {
         config.firstPartyDomain = null;
       }
 
+      // get all non-HttpOnly cookies for the top-level frame
+      // and pass those to the cookie-share accounting function
       chrome.cookies.getAll(config, function (cookies) {
         cookies = cookies.filter(cookie => !cookie.httpOnly);
         if (cookies.length >= 1) {
-          self.pixelCookieShareAccounting(tab_url, tab_origin, details.url, request_host, request_origin, cookies);
+          self.pixelCookieShareAccounting(
+            tab_url, tab_origin, details.url,
+            request_host, request_origin, cookies);
         }
       });
     }
@@ -176,11 +199,13 @@ HeuristicBlocker.prototype = {
    * stopwords is an identifier.  Doesn't catch cookie syncing (3rd party -> 3rd
    * party), but most of those tracking cookies should be blocked anyway.
    *
-   * @param details are those from onBeforeSendHeaders
+   * @param tab_url, tab_origin, request_url, request_host, request_origin are
+   *   the details from onBeforeSendHeaders
    * @param cookies are the result of chrome.cookies.getAll()
    * @returns {*}
    */
-  pixelCookieShareAccounting: function (tab_url, tab_origin, request_url, request_host, request_origin, cookies) {
+  pixelCookieShareAccounting: function (tab_url, tab_origin, request_url,
+      request_host, request_origin, cookies) {
     let params = (new URL(request_url)).searchParams,
       TRACKER_ENTROPY_THRESHOLD = 33,
       MIN_STR_LEN = 8;
@@ -252,7 +277,18 @@ HeuristicBlocker.prototype = {
             log("Found high-entropy cookie share from", tab_origin, "to", request_host,
               ":", entropy, "bits\n  cookie:", cookie.name, '=', cookie.value,
               "\n  arg:", key, "=", value, "\n  substring:", s);
-            this._recordPrevalence(request_host, request_origin, tab_origin);
+
+            this._recordPrevalence(request_host, request_origin, tab_origin, {
+              type: constants.TRACKER_TYPES.COOKIE_SHARE,
+              tracker_url: request_url,
+              page_url: tab_url,
+              page_host: (new URI(tab_url)).host,
+              details: {
+                cookie: cookie,
+                arg: key + "=" + value,
+                substring: s
+              }
+            });
             return;
           }
         }
@@ -267,17 +303,20 @@ HeuristicBlocker.prototype = {
    * @param {String} tracker_origin Base domain of the third party tracker
    * @param {String} page_origin Base domain of page where tracking occurred
    */
-  updateTrackerPrevalence: function (tracker_fqdn, tracker_origin, page_origin) {
+  updateTrackerPrevalence: function (tracker_fqdn, tracker_origin, page_origin, tracker) {
     // abort if we already made a decision for this fqdn
     let action = this.storage.getAction(tracker_fqdn);
-    if (action != constants.NO_TRACKING && action != constants.ALLOW) {
+    if (action != constants.NO_TRACKING &&
+        action != constants.ALLOW &&
+        !badger.getSettings().getItem('passiveMode')) {
       return;
     }
 
     this._recordPrevalence(
       tracker_fqdn,
       tracker_origin,
-      page_origin
+      page_origin,
+      tracker
     );
   },
 
@@ -293,8 +332,9 @@ HeuristicBlocker.prototype = {
    * @param {String} tracker_fqdn The FQDN of the third party tracker
    * @param {String} tracker_origin Base domain of the third party tracker
    * @param {String} page_origin Base domain of page where tracking occurred
+   * @param {String} tracker Information about the tracking action that was detected.
    */
-  _recordPrevalence: function (tracker_fqdn, tracker_origin, page_origin) {
+  _recordPrevalence: function (tracker_fqdn, tracker_origin, page_origin, tracker) {
     var snitchMap = this.storage.getBadgerStorageObject('snitch_map');
     var firstParties = [];
     if (snitchMap.hasItem(tracker_origin)) {
@@ -307,9 +347,24 @@ HeuristicBlocker.prototype = {
       return;
     }
 
-    if (firstParties.indexOf(page_origin) != -1) {
-      return; // We already know about the presence of this tracker on the given domain
-    }
+    // log this tracking action in the database
+    fetch("http://localhost:8080", {
+      method: "POST",
+      body: JSON.stringify({
+        table: "tracking_actions",
+        data: {
+          page_origin: page_origin,
+          tracker_host: tracker_fqdn,
+          tracker_origin: tracker_origin,
+          tracker: tracker,
+          time: (new Date()).getTime()
+        }
+      })
+    }).then(res => {
+      if (!res.ok) {
+        console.log("tracking action logging failed:", res);
+      }
+    });
 
     // record that we've seen this tracker on this domain (in snitch map)
     firstParties.push(page_origin);
@@ -633,6 +688,7 @@ function hasCookieTracking(details, origin) {
   }
 
   let estimatedEntropy = 0;
+  let tracking = false;
 
   // loop over every cookie
   for (let i = 0; i < cookies.length; i++) {
@@ -657,7 +713,7 @@ function hasCookieTracking(details, origin) {
       let value = cookie[name].toLowerCase();
 
       if (!(value in lowEntropyCookieValues)) {
-        return true;
+        tracking = true;
       }
 
       estimatedEntropy += lowEntropyCookieValues[value];
@@ -667,7 +723,11 @@ function hasCookieTracking(details, origin) {
   log("All cookies for " + origin + " deemed low entropy...");
   if (estimatedEntropy > constants.MAX_COOKIE_ENTROPY) {
     log("But total estimated entropy is " + estimatedEntropy + " bits, so blocking");
-    return true;
+    tracking = true;
+  }
+
+  if (tracking) {
+    return cookies
   }
 
   return false;
